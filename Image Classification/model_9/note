@@ -1,0 +1,9 @@
+<<<<<<< HEAD
+調整測試樣本數與訓練樣本數
+trainset = Subset(trainset, range(5000))  # 大幅增加至5K樣本防過擬合 (3K->5K)
+testset = Subset(testset, range(1000))  # 相應增加測試數據至1K (600->1K)
+=======
+調整測試樣本數與訓練樣本數
+trainset = Subset(trainset, range(5000))  # 大幅增加至5K樣本防過擬合 (3K->5K)
+testset = Subset(testset, range(1000))  # 相應增加測試數據至1K (600->1K)
+>>>>>>> 420764095488647da1ecd1309c810893dfec8ea4
