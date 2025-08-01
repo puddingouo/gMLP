@@ -1,0 +1,8 @@
+model_size == "Nano":  # 極小模型 - 新增
+        config = {
+        "depth": 6,  # 極少層數
+        "dim": 64,  # 極小維度
+        "ff_mult": 2,  # 最小FFN倍數
+        "prob_survival": 1.00,
+        "params_target": 0.3,
+}

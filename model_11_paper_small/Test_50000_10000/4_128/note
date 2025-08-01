@@ -1,0 +1,7 @@
+config = {
+        "depth": 4,  # 極少層數
+        "dim": 128,  # 極小維度
+        "ff_mult": 2,  # 最小FFN倍數
+        "prob_survival": 1.00,
+        "params_target": 0.1,
+}
