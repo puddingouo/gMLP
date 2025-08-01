@@ -1,3 +1,4 @@
 # gMLP
 Univerisity project
-https://github.com/lucidrains/g-mlp-pytorch
+
+參考：https://github.com/lucidrains/g-mlp-pytorch
