@@ -51,12 +51,14 @@ class Individual:
         """轉換為字典格式"""
         return {
             "genes": self.genes,
-            "fitness": self.fitness,
-            "accuracy": self.accuracy,
-            "training_time": self.training_time,
-            "parameters": self.parameters,
-            "generation": self.generation,
-            "mutation_history": self.mutation_history,
+            "fitness": float(self.fitness),
+            "accuracy": float(self.accuracy),
+            "training_time": float(self.training_time),
+            "parameters": int(self.parameters),
+            "generation": int(self.generation),
+            "parent_ids": list(self.parent_ids),
+            "mutation_history": list(self.mutation_history),
+            "id": str(self.id),
         }
 
 
@@ -65,7 +67,7 @@ class NetworkConfig:
 
     def __init__(self):
         self.gene_ranges = {
-            # 模型架構基因
+            # 模型架構基因 - 只優化這些參數
             "depth": {"type": "int", "range": (4, 24), "mutation_strength": 2},
             "dim": {"type": "int", "range": (64, 256), "mutation_strength": 16},
             "ff_mult": {"type": "int", "range": (2, 6), "mutation_strength": 1},
@@ -74,34 +76,24 @@ class NetworkConfig:
                 "range": (0.8, 1.0),
                 "mutation_strength": 0.05,
             },
-            "attn_dim": {"type": "int", "range": (32, 128), "mutation_strength": 8},
-            # 訓練超參數基因
-            "lr": {
-                "type": "float",
-                "range": (1e-4, 5e-2),
-                "mutation_strength": 0.01,
-                "log_scale": True,
-            },
-            "weight_decay": {
-                "type": "float",
-                "range": (1e-6, 1e-1),
-                "mutation_strength": 0.01,
-                "log_scale": True,
-            },
-            "batch_size": {"type": "choice", "choices": [32, 64, 128]},
-            "alpha": {"type": "float", "range": (0.05, 0.3), "mutation_strength": 0.05},
-            # 訓練策略基因
-            "use_mixup": {"type": "bool"},
-            "label_smoothing": {
-                "type": "float",
-                "range": (0.0, 0.2),
-                "mutation_strength": 0.02,
-            },
-            "gradient_clip": {
-                "type": "float",
-                "range": (0.5, 2.0),
-                "mutation_strength": 0.2,
-            },
+        }
+
+        # 固定的訓練超參數和策略 - 使用 model_16.py 的預設值
+        self.fixed_params = {
+            # 訓練超參數 (來自 model_16.py 的預設值)
+            "lr": 0.01,
+            "weight_decay": 0.012,
+            "batch_size": 64,  # 來自 load_cifar10_data_enhanced
+            "label_smoothing": 0.08,  # 來自 train_enhanced
+            "gradient_clip": 0.8,  # 來自 train_enhanced
+            # 訓練策略
+            "use_mixup": True,  # 預設啟用
+            "alpha": 0.1,  # 預設值
+            # 優化器和調度器設定
+            "optimizer_type": "AdamW",
+            "scheduler_type": "CosineAnnealingLR",
+            "betas": (0.9, 0.95),  # AdamW 預設值
+            "eta_min": 8e-6,  # CosineAnnealingLR 預設值
         }
 
     def get_random_gene(self, gene_name: str) -> Any:
@@ -241,29 +233,29 @@ class FitnessEvaluator:
             ff_mult=int(genes["ff_mult"]),
             channels=3,
             prob_survival=float(genes["prob_survival"]),
-            attn_dim=int(genes["attn_dim"]),
         )
         return model
 
     def quick_train_evaluate(
         self, model, genes: Dict, trainloader, testloader, device
     ) -> Tuple[float, float, float]:
-        """快速訓練評估 - 增強版"""
+        """快速訓練評估 - 使用 model_16.py 的預設值"""
         from torch.optim import AdamW
         from torch.optim.lr_scheduler import CosineAnnealingLR
 
-        # 快速訓練配置
-        epochs = 3  # 進一步減少訓練時間
-        max_batches_per_epoch = 30  # 限制批次數
+        # 快速訓練配置 - 使用預設值但減少訓練時間
+        epochs = 5  # 快速評估
+        max_batches_per_epoch = 40  # 限制批次數
 
+        # 使用 model_16.py 中的預設配置
         criterion = nn.CrossEntropyLoss(label_smoothing=genes["label_smoothing"])
         optimizer = AdamW(
             model.parameters(),
             lr=genes["lr"],
             weight_decay=genes["weight_decay"],
-            betas=(0.9, 0.95),
+            betas=genes["betas"],
         )
-        scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+        scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=genes["eta_min"])
 
         start_time = time.time()
         epoch_accuracies = []
@@ -280,7 +272,7 @@ class FitnessEvaluator:
                 inputs, targets = inputs.to(device), targets.to(device)
                 optimizer.zero_grad()
 
-                # 可選 Mixup
+                # 使用預設的 Mixup 設定
                 if genes["use_mixup"]:
                     alpha = genes["alpha"]
                     lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
@@ -299,7 +291,7 @@ class FitnessEvaluator:
 
                 loss.backward()
 
-                # 梯度裁剪
+                # 使用預設的梯度裁剪值
                 torch.nn.utils.clip_grad_norm_(
                     model.parameters(), max_norm=genes["gradient_clip"]
                 )
@@ -312,18 +304,22 @@ class FitnessEvaluator:
 
             # 每個epoch後評估一次
             epoch_acc = self.evaluate_accuracy(
-                model, testloader, device, max_batches=10
+                model, testloader, device, max_batches=8
             )
             epoch_accuracies.append(epoch_acc)
+            
+            # 簡化的進度顯示
+            if epoch == 0:
+                logger.info(f"   快速訓練: epoch {epoch+1}/{epochs}, 準確率: {epoch_acc:.1f}%")
 
         training_time = time.time() - start_time
 
         # 最終準確率評估
         final_accuracy = self.evaluate_accuracy(
-            model, testloader, device, max_batches=20
+            model, testloader, device, max_batches=15
         )
 
-        # 計算穩定性分數 (準確率變化的穩定性)
+        # 計算穩定性分數
         if len(epoch_accuracies) > 1:
             stability_score = 1.0 - np.std(epoch_accuracies) / 100.0
         else:
@@ -527,10 +523,15 @@ class AdvancedGeneticOptimizerGMLP:
         }
 
     def create_individual(self, generation: int = 0) -> Individual:
-        """創建一個隨機個體"""
+        """創建一個隨機個體 - 只包含可變的架構基因"""
         genes = {}
+        
+        # 添加可變的模型架構基因
         for gene_name in self.config.gene_ranges.keys():
             genes[gene_name] = self.config.get_random_gene(gene_name)
+        
+        # 添加固定的訓練參數
+        genes.update(self.config.fixed_params)
 
         return Individual(genes=genes, generation=generation)
 
@@ -561,13 +562,37 @@ class AdvancedGeneticOptimizerGMLP:
         self, population: List[Individual], trainloader, testloader, device
     ) -> List[Individual]:
         """順序評估"""
+        successful_evaluations = 0
+        failed_evaluations = 0
+        
         for i, individual in enumerate(population):
-            logger.info(f"評估個體 {i+1}/{len(population)}")
-            cache_key = str(hash(str(sorted(individual.genes.items()))))
-            population[i] = self.evaluator.evaluate(
-                individual, trainloader, testloader, device, cache_key
-            )
-            self.statistics["total_evaluations"] += 1
+            try:
+                logger.info(f"評估個體 {i+1}/{len(population)} (成功:{successful_evaluations}, 失敗:{failed_evaluations})")
+                cache_key = str(hash(str(sorted(individual.genes.items()))))
+                population[i] = self.evaluator.evaluate(
+                    individual, trainloader, testloader, device, cache_key
+                )
+                self.statistics["total_evaluations"] += 1
+                successful_evaluations += 1
+                
+                # 每5個個體顯示一次進度
+                if (i + 1) % 5 == 0 or i == len(population) - 1:
+                    logger.info(f"📊 進度: {i+1}/{len(population)} ({((i+1)/len(population)*100):.1f}%)")
+                    
+            except KeyboardInterrupt:
+                logger.info(f"⚠️  評估在第 {i+1} 個個體時被用戶中斷")
+                # 給剩餘未評估的個體設置默認適應度
+                for j in range(i, len(population)):
+                    if population[j].fitness == 0.0:
+                        population[j].fitness = 0.001  # 設置一個很小的適應度值
+                break
+            except Exception as e:
+                logger.error(f"評估第 {i+1} 個個體時出錯: {e}")
+                failed_evaluations += 1
+                population[i].fitness = 0.001  # 設置一個很小的適應度值
+                continue
+                
+        logger.info(f"評估完成: 成功 {successful_evaluations}, 失敗 {failed_evaluations}")
         return population
 
     def _parallel_evaluate(
@@ -600,12 +625,13 @@ class AdvancedGeneticOptimizerGMLP:
     def _calculate_individual_distance(
         self, ind1: Individual, ind2: Individual
     ) -> float:
-        """計算兩個個體之間的距離"""
+        """計算兩個個體之間的距離 - 只考慮可變基因"""
         distance = 0.0
         gene_count = 0
 
-        for gene_name in ind1.genes.keys():
-            if gene_name in ind2.genes:
+        # 只計算可變基因的距離（模型架構基因）
+        for gene_name in self.config.gene_ranges.keys():
+            if gene_name in ind1.genes and gene_name in ind2.genes:
                 config = self.config.gene_ranges[gene_name]
                 if config["type"] in ["int", "float"]:
                     # 數值基因：正規化差異
@@ -632,67 +658,88 @@ class AdvancedGeneticOptimizerGMLP:
 
         # 初始化種群
         population = self.initialize_population()
+        best_individual_so_far = None
 
         # 進化循環
         for generation in range(self.generations):
             logger.info(f"\n🧬 第 {generation + 1}/{self.generations} 世代")
 
-            # 評估適應度
-            population = self.evaluate_population(
-                population, trainloader, testloader, device
-            )
+            try:
+                # 評估適應度
+                population = self.evaluate_population(
+                    population, trainloader, testloader, device
+                )
 
-            # 排序種群
-            population.sort(key=lambda x: x.fitness, reverse=True)
+                # 排序種群
+                population.sort(key=lambda x: x.fitness, reverse=True)
 
-            # 記錄統計
-            best_individual = population[0]
-            avg_fitness = sum(ind.fitness for ind in population) / len(population)
-            diversity = self.calculate_diversity(population)
+                # 記錄統計
+                best_individual = population[0]
+                best_individual_so_far = best_individual  # 保存當前最佳個體
+                avg_fitness = sum(ind.fitness for ind in population) / len(population)
+                diversity = self.calculate_diversity(population)
 
-            # 更新最佳個體記錄
-            if (
-                self.statistics["best_ever_individual"] is None
-                or best_individual.fitness
-                > self.statistics["best_ever_individual"].fitness
-            ):
-                self.statistics["best_ever_individual"] = copy.deepcopy(best_individual)
+                # 更新最佳個體記錄
+                if (
+                    self.statistics["best_ever_individual"] is None
+                    or best_individual.fitness
+                    > self.statistics["best_ever_individual"].fitness
+                ):
+                    self.statistics["best_ever_individual"] = copy.deepcopy(best_individual)
 
-            # 記錄歷史
-            self.history["best_fitness"].append(best_individual.fitness)
-            self.history["avg_fitness"].append(avg_fitness)
-            self.history["best_accuracy"].append(best_individual.accuracy)
-            self.history["population_diversity"].append(diversity)
-            self.history["best_individuals"].append(copy.deepcopy(best_individual))
+                # 記錄歷史
+                self.history["best_fitness"].append(best_individual.fitness)
+                self.history["avg_fitness"].append(avg_fitness)
+                self.history["best_accuracy"].append(best_individual.accuracy)
+                self.history["population_diversity"].append(diversity)
+                self.history["best_individuals"].append(copy.deepcopy(best_individual))
 
-            # 收斂檢測
-            convergence_measure = self._check_convergence()
-            self.history["convergence_data"].append(convergence_measure)
+                # 收斂檢測
+                convergence_measure = self._check_convergence()
+                self.history["convergence_data"].append(convergence_measure)
 
-            logger.info(f"🏆 最佳適應度: {best_individual.fitness:.4f}")
-            logger.info(f"📈 最佳準確率: {best_individual.accuracy:.2f}%")
-            logger.info(f"🔀 種群多樣性: {diversity:.4f}")
-            logger.info(f"📊 平均適應度: {avg_fitness:.4f}")
-            logger.info(f"📉 收斂程度: {convergence_measure:.4f}")
+                logger.info(f"🏆 最佳適應度: {best_individual.fitness:.4f}")
+                logger.info(f"📈 最佳準確率: {best_individual.accuracy:.2f}%")
+                logger.info(f"🔀 種群多樣性: {diversity:.4f}")
+                logger.info(f"📊 平均適應度: {avg_fitness:.4f}")
+                logger.info(f"📉 收斂程度: {convergence_measure:.4f}")
 
-            # 早停檢查
-            if self._should_early_stop(generation):
-                logger.info("🛑 觸發早停條件，提前結束優化")
+                # 早停檢查
+                if self._should_early_stop(generation):
+                    logger.info("🛑 觸發早停條件，提前結束優化")
+                    break
+
+                if generation < self.generations - 1:
+                    # 生成下一代
+                    population = self._generate_next_generation(population, generation)
+
+            except KeyboardInterrupt:
+                logger.info(f"⚠️  第 {generation + 1} 世代被用戶中斷")
+                if best_individual_so_far:
+                    self.statistics["best_ever_individual"] = copy.deepcopy(best_individual_so_far)
+                break
+            except Exception as e:
+                logger.error(f"第 {generation + 1} 世代評估出錯: {e}")
+                if best_individual_so_far:
+                    self.statistics["best_ever_individual"] = copy.deepcopy(best_individual_so_far)
                 break
 
-            if generation < self.generations - 1:
-                # 生成下一代
-                population = self._generate_next_generation(population, generation)
-
         # 返回最佳個體
-        best_individual = self.statistics["best_ever_individual"] or population[0]
+        best_individual = self.statistics["best_ever_individual"] or (
+            best_individual_so_far if best_individual_so_far else population[0] if population else None
+        )
 
-        logger.info(f"\n🎉 優化完成！")
-        logger.info(f"🏆 最佳配置: {best_individual.genes}")
-        logger.info(f"📈 最佳準確率: {best_individual.accuracy:.2f}%")
-        logger.info(f"🎯 最佳適應度: {best_individual.fitness:.4f}")
-        logger.info(f"📦 模型參數: {best_individual.parameters/1e6:.2f}M")
-        logger.info(f"📊 總評估次數: {self.statistics['total_evaluations']}")
+        if best_individual:
+            logger.info(f"\n🎉 優化完成！")
+            logger.info(f"🏆 最佳配置: {best_individual.genes}")
+            logger.info(f"📈 最佳準確率: {best_individual.accuracy:.2f}%")
+            logger.info(f"🎯 最佳適應度: {best_individual.fitness:.4f}")
+            logger.info(f"� 模型參數: {best_individual.parameters/1e6:.2f}M")
+            logger.info(f"� 總評估次數: {self.statistics['total_evaluations']}")
+        else:
+            logger.warning("⚠️  優化過程中斷，沒有可用的最佳個體")
+            # 創建一個默認個體
+            best_individual = self.create_individual()
 
         return best_individual
 
@@ -764,98 +811,104 @@ class AdvancedGeneticOptimizerGMLP:
     def plot_optimization_history(self):
         """繪製詳細的優化歷史"""
         if not self.history["best_fitness"]:
-            logger.warning("沒有優化歷史數據")
+            logger.warning("沒有足夠的優化歷史數據進行繪製")
+            print("⚠️  優化歷史不足，無法繪製圖表")
             return
 
-        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
-        generations = range(1, len(self.history["best_fitness"]) + 1)
+        try:
+            fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
+            generations = range(1, len(self.history["best_fitness"]) + 1)
 
-        # 適應度進化
-        ax1.plot(
-            generations,
-            self.history["best_fitness"],
-            "r-",
-            linewidth=2,
-            label="Best Fitness",
-        )
-        ax1.plot(
-            generations,
-            self.history["avg_fitness"],
-            "b--",
-            linewidth=2,
-            label="Average Fitness",
-        )
-        ax1.set_title("Fitness Evolution", fontweight="bold", fontsize=14)
-        ax1.set_xlabel("Generation")
-        ax1.set_ylabel("Fitness")
-        ax1.legend()
-        ax1.grid(True, alpha=0.3)
+            # 適應度進化
+            ax1.plot(
+                generations,
+                self.history["best_fitness"],
+                "r-",
+                linewidth=2,
+                label="Best Fitness",
+            )
+            ax1.plot(
+                generations,
+                self.history["avg_fitness"],
+                "b--",
+                linewidth=2,
+                label="Average Fitness",
+            )
+            ax1.set_title("Fitness Evolution", fontweight="bold", fontsize=14)
+            ax1.set_xlabel("Generation")
+            ax1.set_ylabel("Fitness")
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
 
-        # 準確率進化
-        ax2.plot(
-            generations,
-            self.history["best_accuracy"],
-            "g-",
-            linewidth=3,
-            marker="o",
-            markersize=5,
-        )
-        ax2.set_title("Best Accuracy Evolution", fontweight="bold", fontsize=14)
-        ax2.set_xlabel("Generation")
-        ax2.set_ylabel("Accuracy (%)")
-        ax2.grid(True, alpha=0.3)
-        ax2.set_ylim(0, 100)
+            # 準確率進化
+            ax2.plot(
+                generations,
+                self.history["best_accuracy"],
+                "g-",
+                linewidth=3,
+                marker="o",
+                markersize=5,
+            )
+            ax2.set_title("Best Accuracy Evolution", fontweight="bold", fontsize=14)
+            ax2.set_xlabel("Generation")
+            ax2.set_ylabel("Accuracy (%)")
+            ax2.grid(True, alpha=0.3)
+            ax2.set_ylim(0, 100)
 
-        # 種群多樣性和收斂
-        ax3.plot(
-            generations,
-            self.history["population_diversity"],
-            "purple",
-            linewidth=2,
-            label="Diversity",
-        )
-        ax3_twin = ax3.twinx()
-        ax3_twin.plot(
-            generations,
-            self.history["convergence_data"],
-            "orange",
-            linewidth=2,
-            label="Convergence",
-        )
-        ax3.set_title("Diversity & Convergence", fontweight="bold", fontsize=14)
-        ax3.set_xlabel("Generation")
-        ax3.set_ylabel("Diversity", color="purple")
-        ax3_twin.set_ylabel("Convergence", color="orange")
-        ax3.grid(True, alpha=0.3)
+            # 種群多樣性和收斂
+            ax3.plot(
+                generations,
+                self.history["population_diversity"],
+                "purple",
+                linewidth=2,
+                label="Diversity",
+            )
+            ax3_twin = ax3.twinx()
+            ax3_twin.plot(
+                generations,
+                self.history["convergence_data"],
+                "orange",
+                linewidth=2,
+                label="Convergence",
+            )
+            ax3.set_title("Diversity & Convergence", fontweight="bold", fontsize=14)
+            ax3.set_xlabel("Generation")
+            ax3.set_ylabel("Diversity", color="purple")
+            ax3_twin.set_ylabel("Convergence", color="orange")
+            ax3.grid(True, alpha=0.3)
 
-        # 參數數量進化
-        param_counts = [
-            ind.parameters / 1e6 for ind in self.history["best_individuals"]
-        ]
-        ax4.plot(
-            generations, param_counts, "brown", linewidth=2, marker="s", markersize=4
-        )
-        ax4.set_title("Best Model Size Evolution", fontweight="bold", fontsize=14)
-        ax4.set_xlabel("Generation")
-        ax4.set_ylabel("Parameters (M)")
-        ax4.grid(True, alpha=0.3)
+            # 參數數量進化
+            param_counts = [
+                ind.parameters / 1e6 for ind in self.history["best_individuals"]
+            ]
+            ax4.plot(
+                generations, param_counts, "brown", linewidth=2, marker="s", markersize=4
+            )
+            ax4.set_title("Best Model Size Evolution", fontweight="bold", fontsize=14)
+            ax4.set_xlabel("Generation")
+            ax4.set_ylabel("Parameters (M)")
+            ax4.grid(True, alpha=0.3)
 
-        plt.tight_layout()
-        plt.savefig(
-            "advanced_genetic_optimization_history.png", dpi=300, bbox_inches="tight"
-        )
-        plt.show()
+            plt.tight_layout()
+            plt.savefig(
+                "advanced_genetic_optimization_history.png", dpi=300, bbox_inches="tight"
+            )
+            plt.show()
 
-        # 額外統計圖
-        self._plot_gene_evolution()
+            # 額外統計圖
+            self._plot_gene_evolution()
+
+        except Exception as e:
+            logger.error(f"繪製優化歷史時出錯: {e}")
+            print(f"⚠️  無法繪製優化歷史: {e}")
 
     def _plot_gene_evolution(self):
         """繪製基因進化歷史"""
         if not self.history["best_individuals"]:
             return
 
-        # 選擇關鍵基因進行可視化
-        key_genes = ["depth", "dim", "lr", "weight_decay"]
+        # 選擇架構基因進行可視化
+        key_genes = ["depth", "dim", "ff_mult", "prob_survival"]
         available_genes = [
             g for g in key_genes if g in self.history["best_individuals"][0].genes
         ]
@@ -880,9 +933,7 @@ class AdvancedGeneticOptimizerGMLP:
             axes[i].set_ylabel(gene_name.title())
             axes[i].grid(True, alpha=0.3)
 
-            # 對數尺度處理
-            if gene_name in ["lr", "weight_decay"]:
-                axes[i].set_yscale("log")
+            # 不需要對數尺度，因為現在只有架構參數
 
         plt.tight_layout()
         plt.savefig("gene_evolution_history.png", dpi=300, bbox_inches="tight")
@@ -893,6 +944,20 @@ class AdvancedGeneticOptimizerGMLP:
         if filename is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"advanced_genetic_optimization_{timestamp}.json"
+
+        # 轉換 Individual 對象為字典格式
+        serializable_history = {
+            "best_fitness": [float(x) for x in self.history["best_fitness"]],
+            "avg_fitness": [float(x) for x in self.history["avg_fitness"]],
+            "best_accuracy": [float(x) for x in self.history["best_accuracy"]],
+            "population_diversity": [
+                float(x) for x in self.history["population_diversity"]
+            ],
+            "best_individuals": [
+                ind.to_dict() for ind in self.history["best_individuals"]
+            ],
+            "convergence_data": [float(x) for x in self.history["convergence_data"]],
+        }
 
         results = {
             "best_individual": best_individual.to_dict(),
@@ -905,17 +970,21 @@ class AdvancedGeneticOptimizerGMLP:
                 "fitness_weights": self.evaluator.weights,
             },
             "statistics": {
-                "total_evaluations": self.statistics["total_evaluations"],
-                "cache_hits": self.statistics["cache_hits"],
-                "final_diversity": (
+                "total_evaluations": int(self.statistics["total_evaluations"]),
+                "cache_hits": int(self.statistics["cache_hits"]),
+                "final_diversity": float(
                     self.history["population_diversity"][-1]
                     if self.history["population_diversity"]
-                    else 0
+                    else 0.0
                 ),
             },
-            "history": self.history,
+            "history": serializable_history,
             "gene_ranges": {
-                k: {kk: vv for kk, vv in v.items() if kk != "log_scale"}
+                k: {
+                    kk: (list(vv) if isinstance(vv, tuple) else vv)
+                    for kk, vv in v.items()
+                    if kk != "log_scale" and not callable(vv)
+                }
                 for k, v in self.config.gene_ranges.items()
             },
         }
@@ -1017,27 +1086,41 @@ def run_genetic_optimization():
         print(f"\n⏱️ 總優化時間: {(end_time - start_time)/60:.1f} 分鐘")
 
         # 繪製詳細歷史
+        print("\n📈 生成優化歷史圖表...")
         optimizer.plot_optimization_history()
 
         # 保存結果
+        print("\n💾 保存優化結果...")
         optimizer.save_results(best_individual)
 
         # 詢問是否進行完整訓練
         print(f"\n" + "=" * 60)
-        use_best = input("🎯 是否使用最佳配置進行完整訓練? (y/n): ").strip().lower()
-
-        if use_best in ["y", "yes"]:
-            print("\n🚀 開始使用最佳配置進行完整訓練...")
-            train_with_best_config(best_individual, trainloader, testloader, device)
+        if best_individual and best_individual.fitness > 0:
+            use_best = input("🎯 是否使用最佳配置進行完整訓練? (y/n): ").strip().lower()
+            
+            if use_best in ["y", "yes"]:
+                print("\n🚀 開始使用最佳配置進行完整訓練...")
+                train_with_best_config(best_individual, trainloader, testloader, device)
+        else:
+            print("⚠️  沒有找到有效的最佳配置，跳過完整訓練")
 
     except KeyboardInterrupt:
-        print("\n\n⏹️  優化已中斷")
-        if "optimizer" in locals():
-            optimizer.plot_optimization_history()
+        print("\n\n⏹️  優化已被用戶中斷")
+        if "optimizer" in locals() and hasattr(optimizer, 'history'):
+            print("🔄 嘗試繪製已有的優化歷史...")
+            try:
+                optimizer.plot_optimization_history()
+            except Exception as e:
+                print(f"⚠️  無法繪製歷史圖表: {e}")
+        print("💡 提示: 您可以調整參數後重新運行")
     except Exception as e:
         logger.error(f"優化過程中發生錯誤: {e}")
+        print(f"\n❌ 優化失敗: {e}")
+        print("💡 建議檢查:")
+        print("   - 確認 model_16.py 文件存在且可導入")
+        print("   - 確認 g_mlp_pytorch 庫已正確安裝")
+        print("   - 檢查系統內存是否充足")
         import traceback
-
         traceback.print_exc()
 
 
@@ -1064,24 +1147,26 @@ def train_with_best_config(
         "dim": int(best_individual.genes["dim"]),
         "ff_mult": int(best_individual.genes["ff_mult"]),
         "prob_survival": float(best_individual.genes["prob_survival"]),
-        "attn_dim": int(best_individual.genes["attn_dim"]),
+        "attn_dim": int(best_individual.genes["dim"]),  # 使用 dim 作為 attn_dim 的預設值
         "estimated_params": best_individual.parameters / 1e6,
     }
 
-    # 轉換基因為訓練配置
+    # 轉換基因為訓練配置 - 使用 model_16.py 的預設值
     training_params = {
-        "lr": float(best_individual.genes["lr"]),
-        "weight_decay": float(best_individual.genes["weight_decay"]),
-        "epochs": 40,  # 完整訓練使用更多輪數
-        "use_mixup": bool(best_individual.genes["use_mixup"]),
-        "alpha": float(best_individual.genes["alpha"]),
-        "batch_split": 1,
-        "use_enhanced_transform": False,
-        "optimizer_type": "AdamW",
-        "scheduler_type": "CosineAnnealingLR",
-        "use_early_stopping": True,
-        "patience": 15,  # 增加耐心值
-        "min_delta": 0.001,
+        # 來自遺傳算法優化的架構參數已在 model_config 中
+        # 這裡使用 model_16.py 的預設訓練配置
+        "lr": best_individual.genes["lr"],
+        "weight_decay": best_individual.genes["weight_decay"],
+        "epochs": 100,  # 完整訓練使用更多輪數
+        "use_mixup": best_individual.genes["use_mixup"],
+        "alpha": best_individual.genes["alpha"],
+        "batch_split": 1,  # model_16.py 預設值
+        "use_enhanced_transform": False,  # 使用標準變換
+        "optimizer_type": best_individual.genes["optimizer_type"],
+        "scheduler_type": best_individual.genes["scheduler_type"],
+        "use_early_stopping": True,  # model_16.py 預設值
+        "patience": 10,  # model_16.py 預設值
+        "min_delta": 0.001,  # model_16.py 預設值
     }
 
     print(f"📊 最佳模型配置:")
