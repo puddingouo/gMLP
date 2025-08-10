@@ -67,34 +67,51 @@ class NetworkConfig:
 
     def __init__(self):
         self.gene_ranges = {
-            # 模型架構基因 - 擴大範圍以增加隨機性和多樣性
+            # 模型架構基因 - 基於CIFAR-10最佳實踐調整範圍
             "depth": {
                 "type": "int",
-                "range": (4, 36),  # 擴大深度範圍，允許更多變化
+                "range": (
+                    6,
+                    20,
+                ),  # 聚焦在經驗證有效的深度範圍，6-20層對CIFAR-10效果最佳
                 "mutation_strength": 1,
             },
             "dim": {
                 "type": "int",
-                "range": (4, 192),  # 擴大維度範圍，增加模型大小的多樣性
+                "range": (
+                    64,
+                    256,
+                ),  # 提升最小維度到64，最大擴展到256，這個範圍對CIFAR-10更合適
                 "mutation_strength": 16,
             },
             "ff_mult": {
                 "type": "int",
-                "range": (2, 4),  # 允許更多FFN倍數選擇
+                "range": (2, 6),  # 擴大FFN倍數到6，允許更大的前饋網絡
                 "mutation_strength": 1,
             },
             "prob_survival": {
                 "type": "float",
-                "range": (0.85, 1.0),  # 擴大存活概率範圍
-                "mutation_strength": 0.03,
+                "range": (0.8, 1.0),  # 稍微降低最小存活概率，允許更多隨機性
+                "mutation_strength": 0.05,
+            },
+            # 新增可變的訓練超參數基因
+            "lr": {
+                "type": "float",
+                "range": (0.005, 0.02),  # 學習率在更合理的範圍內變化
+                "mutation_strength": 0.002,
+                "log_scale": False,
+            },
+            "weight_decay": {
+                "type": "float",
+                "range": (0.005, 0.02),  # 權重衰減的有效範圍
+                "mutation_strength": 0.002,
+                "log_scale": False,
             },
         }
 
-        # 固定的訓練超參數和策略 - 使用 model_16.py 的預設值
+        # 固定的訓練超參數和策略 - lr和weight_decay現在是可變基因
         self.fixed_params = {
-            # 訓練超參數 (來自 model_16.py 的預設值)
-            "lr": 0.01,
-            "weight_decay": 0.012,
+            # 訓練配置 (來自 model_16.py 的預設值)
             "batch_size": 64,  # 來自 load_cifar10_data_enhanced
             "label_smoothing": 0.08,  # 來自 train_enhanced
             "gradient_clip": 0.8,  # 來自 train_enhanced
@@ -105,7 +122,7 @@ class NetworkConfig:
             "optimizer_type": "AdamW",
             "scheduler_type": "CosineAnnealingLR",
             "betas": (0.9, 0.95),  # AdamW 預設值
-            "eta_min": 8e-6,  # CosineAnnealingLR 預設值
+            "eta_min": 5e-6,  # CosineAnnealingLR 最小學習率
         }
 
     def get_random_gene(self, gene_name: str) -> Any:
@@ -164,9 +181,9 @@ class FitnessEvaluator:
 
     def __init__(self, weights: Dict[str, float] = None):
         self.weights = weights or {
-            "accuracy": 0.6,  # 準確率權重
-            "efficiency": 0.25,  # 效率權重 (參數少/訓練快)
-            "stability": 0.15,  # 穩定性權重
+            "accuracy": 0.75,  # 提高準確率權重，更重視模型性能
+            "efficiency": 0.15,  # 降低效率權重
+            "stability": 0.1,  # 降低穩定性權重
         }
         self.evaluation_cache = {}  # 評估快取
 
@@ -253,11 +270,11 @@ class FitnessEvaluator:
         raw_ff_mult = int(genes["ff_mult"])
         raw_prob_survival = float(genes["prob_survival"])
 
-        # 確保參數在合理範圍內（但保持隨機性和多樣性）
-        dim = max(4, min(192, raw_dim))  # 允許更大的維度範圍：4-192
-        depth = max(4, min(36, raw_depth))  # 允許更深的模型：4-36
-        ff_mult = max(2, min(4, raw_ff_mult))  # 允許更多FFN選擇
-        prob_survival = max(0.85, min(1.0, raw_prob_survival))  # 更寬的存活概率範圍
+        # 確保參數在合理範圍內（基於新的最佳實踐範圍）
+        dim = max(64, min(256, raw_dim))  # 聚焦在64-256維度範圍，對CIFAR-10更有效
+        depth = max(6, min(20, raw_depth))  # 聚焦在6-20層深度，經驗證的有效範圍
+        ff_mult = max(2, min(6, raw_ff_mult))  # 允許更大的FFN倍數：2-6
+        prob_survival = max(0.8, min(1.0, raw_prob_survival))  # 稍微放寬存活概率範圍
 
         # 多次嘗試創建模型，使用遞減的複雜度策略
         model_attempts = [
@@ -268,22 +285,20 @@ class FitnessEvaluator:
                 "ff_mult": ff_mult,
                 "prob_survival": prob_survival,
             },
-            # 第二次嘗試：適度降低複雜度但保持隨機性
+            # 第二次嘗試：適度降低複雜度但保持在有效範圍內
             {
-                "dim": max(4, min(128, dim - 16)),  # 稍微降低維度，但保持在4-128範圍
-                "depth": max(4, min(24, depth - 4)),  # 稍微降低深度，但保持在4-24範圍
-                "ff_mult": max(2, ff_mult - 1),  # 降低ff_mult但保持隨機
+                "dim": max(64, min(192, dim - 32)),  # 降低維度但保持在64-192範圍
+                "depth": max(6, min(16, depth - 2)),  # 降低深度但保持在6-16範圍
+                "ff_mult": max(2, min(4, ff_mult - 1)),  # 降低ff_mult到更保守的範圍
                 "prob_survival": min(1.0, prob_survival + 0.05),  # 稍微提高存活概率
             },
-            # 第三次嘗試：使用基於原始基因的隨機化安全配置
+            # 第三次嘗試：使用基於原始基因的安全配置
             {
-                "dim": max(
-                    4, 4 + ((raw_dim - 4) % 64)
-                ),  # 基於原始基因的隨機維度：4-68範圍內
-                "depth": max(
-                    4, 4 + (raw_depth % 8)
-                ),  # 基於原始基因的隨機深度：4-11 中的一個
-                "ff_mult": 2 + (raw_ff_mult % 2),  # 基於原始基因的隨機ff_mult：2或3
+                "dim": 64
+                + ((raw_dim - 64) % 64),  # 基於原始基因的維度：64, 96, 128範圍內
+                "depth": 6 + (raw_depth % 6),  # 基於原始基因的深度：6-11中的一個
+                "ff_mult": 2
+                + (raw_ff_mult % 3),  # 基於原始基因的ff_mult：2, 3, 4中的一個
                 "prob_survival": 0.9 + (raw_prob_survival % 0.1),  # 0.9-1.0 之間
             },
         ]
@@ -363,9 +378,9 @@ class FitnessEvaluator:
         from torch.optim import AdamW
         from torch.optim.lr_scheduler import CosineAnnealingLR
 
-        # 快速訓練配置 - 使用預設值但減少訓練時間
-        epochs = 8  # 每個個體訓練8個epochs，獲得更好的評估結果
-        max_batches_per_epoch = 35  # 減少批次數
+        # 快速訓練配置 - 使用預設值但提升訓練強度以獲得更好的評估
+        epochs = 15  # 增加到15個epochs，讓模型有更充分的學習時間
+        max_batches_per_epoch = 50  # 增加批次數，使用更多訓練數據
 
         # 使用 model_16.py 中的預設配置
         try:
@@ -374,12 +389,16 @@ class FitnessEvaluator:
             )  # 使用固定值避免基因錯誤
             optimizer = AdamW(
                 model.parameters(),
-                lr=genes.get("lr", 0.01),  # 使用預設值避免KeyError
-                weight_decay=genes.get("weight_decay", 0.012),
+                lr=genes["lr"],  # 現在lr是可變基因，直接使用
+                weight_decay=genes[
+                    "weight_decay"
+                ],  # 現在weight_decay是可變基因，直接使用
                 betas=genes.get("betas", (0.9, 0.95)),
             )
             scheduler = CosineAnnealingLR(
-                optimizer, T_max=epochs, eta_min=genes.get("eta_min", 8e-6)
+                optimizer,
+                T_max=epochs,
+                eta_min=genes.get("eta_min", 5e-6),  # 更低的最小學習率，適應更長的訓練
             )
         except Exception as e:
             logger.error(f"優化器設置失敗: {e}")
@@ -387,6 +406,9 @@ class FitnessEvaluator:
 
         start_time = time.time()
         epoch_accuracies = []
+        best_accuracy = 0.0
+        patience_counter = 0
+        patience = 5  # 如果5個epoch沒有改善就停止
 
         for epoch in range(epochs):
             try:
@@ -449,17 +471,35 @@ class FitnessEvaluator:
 
                 scheduler.step()
 
-                # 每個epoch後評估一次
+                # 每個epoch後評估一次，使用更多測試數據
                 try:
                     epoch_acc = self.evaluate_accuracy(
-                        model, testloader, device, max_batches=5
+                        model, testloader, device, max_batches=10  # 增加評估批次數
                     )
                     epoch_accuracies.append(epoch_acc)
 
+                    # 早期停止邏輯
+                    if epoch_acc > best_accuracy:
+                        best_accuracy = epoch_acc
+                        patience_counter = 0
+                    else:
+                        patience_counter += 1
+
                     # 顯示每個 epoch 的進度
                     logger.info(
-                        f"   快速訓練: epoch {epoch+1}/{epochs}, 準確率: {epoch_acc:.1f}%"
+                        f"   快速訓練: epoch {epoch+1}/{epochs}, 準確率: {epoch_acc:.1f}% (最佳: {best_accuracy:.1f}%)"
                     )
+
+                    # 早期停止檢查
+                    if patience_counter >= patience and epoch >= 8:  # 至少訓練8個epoch
+                        logger.info(
+                            f"   早期停止: {patience}個epoch無改善，當前最佳準確率: {best_accuracy:.1f}%"
+                        )
+                        # 為剩餘的 epochs 填充最佳準確率
+                        remaining_epochs = epochs - epoch - 1
+                        epoch_accuracies.extend([best_accuracy] * remaining_epochs)
+                        break
+
                 except Exception as e:
                     logger.warning(f"準確率評估失敗: {e}")
                     epoch_accuracies.append(10.0)
@@ -480,10 +520,10 @@ class FitnessEvaluator:
 
         training_time = time.time() - start_time
 
-        # 最終準確率評估
+        # 最終準確率評估，使用更多測試數據確保準確性
         try:
             final_accuracy = self.evaluate_accuracy(
-                model, testloader, device, max_batches=8
+                model, testloader, device, max_batches=15  # 大幅增加最終評估的批次數
             )
         except Exception as e:
             logger.warning(f"最終準確率評估失敗: {e}")
@@ -551,11 +591,13 @@ class FitnessEvaluator:
             + self.weights["stability"] * stability_norm
         )
 
-        # 添加準確率閾值獎勵
+        # 基於改進後的訓練，調整準確率閾值獎勵
+        if accuracy > 70.0:
+            fitness += 0.08  # 準確率超過70%給獎勵（降低門檻）
         if accuracy > 80.0:
             fitness += 0.1  # 準確率超過80%給額外獎勵
         if accuracy > 90.0:
-            fitness += 0.1  # 準確率超過90%給更多獎勵
+            fitness += 0.15  # 準確率超過90%給更多獎勵（增加獎勵）
 
         return fitness
 
