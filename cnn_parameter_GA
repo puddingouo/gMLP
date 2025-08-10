@@ -1,0 +1,247 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import Dataset, DataLoader
+from g_mlp_pytorch import gMLPVision
+from tqdm import tqdm
+import multiprocessing
+import time
+import numpy as np
+import random
+import matplotlib.pyplot as plt
+
+# ---------------------------
+# 裝置設定
+# ---------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Device: ", device)
+
+
+# ---------------------------
+# Mixup 功能
+# ---------------------------
+def mixup_data(x, y, alpha=0.1, lam=1.0, count=0, device="cpu"):
+    if count == 0:
+        if alpha > 0:
+            lam = np.random.beta(alpha, alpha)
+        else:
+            lam = 1.0
+    batch_size = x.size()[0]
+    index = torch.randperm(batch_size).to(device)
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+
+# ---------------------------
+# CIFAR-10 數據增強
+# ---------------------------
+train_transform = transforms.Compose(
+    [
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.1),
+        transforms.RandomPerspective(distortion_scale=0.5, p=0.5),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ToTensor(),
+    ]
+)
+test_transform = transforms.Compose(
+    [
+        transforms.ToTensor(),
+    ]
+)
+
+
+class CIFAR10_dataset(Dataset):
+    def __init__(self, partition="train", transform=None):
+        self.partition = partition
+        self.transform = transform
+        if self.partition == "train":
+            self.data = torchvision.datasets.CIFAR10(
+                ".data/", train=True, download=True
+            )
+        else:
+            self.data = torchvision.datasets.CIFAR10(
+                ".data/", train=False, download=True
+            )
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        image = self.data[idx][0]
+        image_tensor = self.transform(image)
+        label = torch.tensor(self.data[idx][1])
+        label = F.one_hot(label, num_classes=10).float()
+        return {"img": image_tensor, "label": label}
+
+
+# ---------------------------
+# gMLP 模型生成
+# ---------------------------
+def create_gmlp_model(depth=12, dim=256, ff_mult=4, patch_size=4):
+    return gMLPVision(
+        image_size=32,
+        patch_size=patch_size,
+        num_classes=10,
+        dim=dim,
+        depth=depth,
+        ff_mult=ff_mult,
+        channels=3,
+        prob_survival=0.9,
+    )
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+# ---------------------------
+# 訓練函式
+# ---------------------------
+def train_gmlp_model(depth=12, dim=256, ff_mult=4, patch_size=4, quick_train=False):
+    use_mixup = True
+    mixup_alpha = 0.1
+
+    train_dataset = CIFAR10_dataset(partition="train", transform=train_transform)
+    test_dataset = CIFAR10_dataset(partition="test", transform=test_transform)
+    batch_size = 100
+    num_workers = max(1, multiprocessing.cpu_count() - 1)
+
+    train_dataloader = DataLoader(
+        train_dataset, batch_size, shuffle=True, num_workers=num_workers
+    )
+    test_dataloader = DataLoader(
+        test_dataset, batch_size, shuffle=False, num_workers=num_workers
+    )
+
+    net = create_gmlp_model(depth, dim, ff_mult, patch_size).to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.AdamW(
+        net.parameters(), lr=0.001, weight_decay=1e-4, betas=(0.9, 0.95)
+    )
+    lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, factor=0.1, patience=10, min_lr=1e-5
+    )
+
+    epochs = 5 if quick_train else 100
+    best_accuracy = -1
+    best_epoch = 0
+
+    for epoch in range(epochs):
+        net.train()
+        train_loss, train_correct = 0, 0
+        lam = 1.0
+        for batch in train_dataloader:
+            images = batch["img"].to(device)
+            labels = batch["label"].to(device)
+            optimizer.zero_grad()
+            if use_mixup:
+                images, labels_a, labels_b, lam = mixup_data(
+                    images, labels, mixup_alpha, lam, 0, device
+                )
+                outputs = net(images)
+                loss = mixup_criterion(criterion, outputs, labels_a, labels_b, lam)
+            else:
+                outputs = net(images)
+                loss = criterion(outputs, labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
+            optimizer.step()
+            if use_mixup:
+                labels_idx_a = torch.argmax(labels_a, dim=1)
+                labels_idx_b = torch.argmax(labels_b, dim=1)
+                pred = torch.argmax(outputs, dim=1)
+                correct_a = pred.eq(labels_idx_a).sum().item()
+                correct_b = pred.eq(labels_idx_b).sum().item()
+                train_correct += lam * correct_a + (1 - lam) * correct_b
+            else:
+                labels_idx = torch.argmax(labels, dim=1)
+                pred = torch.argmax(outputs, dim=1)
+                train_correct += pred.eq(labels_idx).sum().item()
+            train_loss += loss.item()
+        train_accuracy = 100.0 * train_correct / len(train_dataloader.dataset)
+
+        # 測試
+        net.eval()
+        test_loss, test_correct = 0, 0
+        with torch.no_grad():
+            for batch in test_dataloader:
+                images = batch["img"].to(device)
+                labels = batch["label"].to(device)
+                outputs = net(images)
+                test_loss += criterion(outputs, labels)
+                labels_idx = torch.argmax(labels, dim=1)
+                pred = torch.argmax(outputs, dim=1)
+                test_correct += pred.eq(labels_idx).sum().item()
+        lr_scheduler.step(test_loss)
+        test_accuracy = 100.0 * test_correct / len(test_dataloader.dataset)
+
+        if test_accuracy > best_accuracy:
+            best_accuracy = test_accuracy
+            best_epoch = epoch
+            if not quick_train:
+                torch.save(net.state_dict(), "best_gmlp_model.pt")
+
+    return None, None, None, None, best_accuracy
+
+
+# ---------------------------
+# GA 搜尋最佳架構
+# ---------------------------
+GA_PARAM_SPACE = {
+    "depth": [6, 8, 10, 12, 14, 16],
+    "dim": [128, 192, 256, 320, 384],
+    "ff_mult": [2, 3, 4, 5],
+    "patch_size": [2, 4, 8],
+}
+
+
+def ga_search(generations=5, population_size=6):
+    population = [
+        {k: random.choice(v) for k, v in GA_PARAM_SPACE.items()}
+        for _ in range(population_size)
+    ]
+    best_params = None
+    best_acc = -1
+
+    for gen in range(generations):
+        print(f"\n=== GA Generation {gen+1}/{generations} ===")
+        scored_population = []
+        for i, params in enumerate(population):
+            print(f"\n[GA] 個體 {i+1}: {params}")
+            _, _, _, _, acc = train_gmlp_model(**params, quick_train=True)
+            scored_population.append((params, acc))
+            if acc > best_acc:
+                best_acc = acc
+                best_params = params
+        scored_population.sort(key=lambda x: x[1], reverse=True)
+        survivors = [p[0] for p in scored_population[: population_size // 2]]
+        new_population = survivors.copy()
+        while len(new_population) < population_size:
+            p1, p2 = random.sample(survivors, 2)
+            child = {k: random.choice([p1[k], p2[k]]) for k in GA_PARAM_SPACE.keys()}
+            if random.random() < 0.2:
+                key = random.choice(list(GA_PARAM_SPACE.keys()))
+                child[key] = random.choice(GA_PARAM_SPACE[key])
+            new_population.append(child)
+        population = new_population
+
+    print(f"\n🌟 GA 最佳組合: {best_params}, 準確率: {best_acc:.2f}%")
+    return best_params
+
+
+# ---------------------------
+# 主程式
+# ---------------------------
+if __name__ == "__main__":
+    print("🚀 GA 搜尋最佳 gMLP 架構中...")
+    best_params = ga_search(generations=3, population_size=4)  # 減少代數方便測試
+    print("\n🚀 使用最佳參數完整訓練...")
+    train_gmlp_model(**best_params, quick_train=False)
