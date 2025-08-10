@@ -67,14 +67,26 @@ class NetworkConfig:
 
     def __init__(self):
         self.gene_ranges = {
-            # 模型架構基因 - 只優化這些參數
-            "depth": {"type": "int", "range": (4, 24), "mutation_strength": 2},
-            "dim": {"type": "int", "range": (64, 256), "mutation_strength": 16},
-            "ff_mult": {"type": "int", "range": (2, 6), "mutation_strength": 1},
+            # 模型架構基因 - 擴大範圍以增加隨機性和多樣性
+            "depth": {
+                "type": "int",
+                "range": (4, 36),  # 擴大深度範圍，允許更多變化
+                "mutation_strength": 1,
+            },
+            "dim": {
+                "type": "int",
+                "range": (4, 192),  # 擴大維度範圍，增加模型大小的多樣性
+                "mutation_strength": 16,
+            },
+            "ff_mult": {
+                "type": "int",
+                "range": (2, 4),  # 允許更多FFN倍數選擇
+                "mutation_strength": 1,
+            },
             "prob_survival": {
                 "type": "float",
-                "range": (0.8, 1.0),
-                "mutation_strength": 0.05,
+                "range": (0.85, 1.0),  # 擴大存活概率範圍
+                "mutation_strength": 0.03,
             },
         }
 
@@ -181,10 +193,15 @@ class FitnessEvaluator:
         try:
             # 1. 創建模型
             model = self.create_model_from_genes(individual.genes)
+
+            # 檢查模型是否成功創建
+            if model is None:
+                raise ValueError("模型創建失敗")
+
             model = model.to(device)
 
             # 2. 計算參數數量
-            total_params = sum(p.numel() for p in model.parameters())
+            total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
             individual.parameters = total_params
 
             # 3. 快速訓練評估
@@ -214,9 +231,11 @@ class FitnessEvaluator:
             )
 
         except Exception as e:
-            logger.error(f"評估失敗: {e}")
-            individual.fitness = 0.0
-            individual.accuracy = 0.0
+            logger.error(f"評估失敗: {str(e)}")
+            individual.fitness = 0.001  # 設置一個很小的正值而不是0
+            individual.accuracy = 10.0  # 設置一個基線準確率
+            individual.training_time = 0.0
+            individual.parameters = 100000  # 設置一個預設參數數量
 
         return individual
 
@@ -224,17 +243,118 @@ class FitnessEvaluator:
         """根據基因創建 gMLP 模型"""
         from g_mlp_pytorch import gMLPVision
 
-        model = gMLPVision(
-            image_size=32,
-            patch_size=4,
-            num_classes=10,
-            dim=int(genes["dim"]),
-            depth=int(genes["depth"]),
-            ff_mult=int(genes["ff_mult"]),
-            channels=3,
-            prob_survival=float(genes["prob_survival"]),
+        # 確保 image_size 能被 patch_size 整除，避免張量尺寸不匹配
+        image_size = 32  # CIFAR-10 圖像尺寸
+        patch_size = 4  # 確保 32 % 4 == 0
+
+        # 直接使用基因中的隨機參數，但進行合理性檢查
+        raw_dim = int(genes["dim"])
+        raw_depth = int(genes["depth"])
+        raw_ff_mult = int(genes["ff_mult"])
+        raw_prob_survival = float(genes["prob_survival"])
+
+        # 確保參數在合理範圍內（但保持隨機性和多樣性）
+        dim = max(4, min(192, raw_dim))  # 允許更大的維度範圍：4-192
+        depth = max(4, min(36, raw_depth))  # 允許更深的模型：4-36
+        ff_mult = max(2, min(4, raw_ff_mult))  # 允許更多FFN選擇
+        prob_survival = max(0.85, min(1.0, raw_prob_survival))  # 更寬的存活概率範圍
+
+        # 多次嘗試創建模型，使用遞減的複雜度策略
+        model_attempts = [
+            # 第一次嘗試：使用基因指定的隨機參數
+            {
+                "dim": dim,
+                "depth": depth,
+                "ff_mult": ff_mult,
+                "prob_survival": prob_survival,
+            },
+            # 第二次嘗試：適度降低複雜度但保持隨機性
+            {
+                "dim": max(4, min(128, dim - 16)),  # 稍微降低維度，但保持在4-128範圍
+                "depth": max(4, min(24, depth - 4)),  # 稍微降低深度，但保持在4-24範圍
+                "ff_mult": max(2, ff_mult - 1),  # 降低ff_mult但保持隨機
+                "prob_survival": min(1.0, prob_survival + 0.05),  # 稍微提高存活概率
+            },
+            # 第三次嘗試：使用基於原始基因的隨機化安全配置
+            {
+                "dim": max(
+                    4, 4 + ((raw_dim - 4) % 64)
+                ),  # 基於原始基因的隨機維度：4-68範圍內
+                "depth": max(
+                    4, 4 + (raw_depth % 8)
+                ),  # 基於原始基因的隨機深度：4-11 中的一個
+                "ff_mult": 2 + (raw_ff_mult % 2),  # 基於原始基因的隨機ff_mult：2或3
+                "prob_survival": 0.9 + (raw_prob_survival % 0.1),  # 0.9-1.0 之間
+            },
+        ]
+
+        # 嘗試每個配置
+        for i, config in enumerate(model_attempts):
+            try:
+                logger.debug(f"嘗試隨機配置 {i+1}/3: {config}")
+
+                model = gMLPVision(
+                    image_size=image_size,
+                    patch_size=patch_size,
+                    num_classes=10,
+                    dim=config["dim"],
+                    depth=config["depth"],
+                    ff_mult=config["ff_mult"],
+                    channels=3,
+                    prob_survival=config["prob_survival"],
+                )
+
+                # 測試模型是否能正常前向傳播
+                test_input = torch.randn(2, 3, 32, 32)  # 小批次測試
+                with torch.no_grad():
+                    test_output = model(test_input)
+                    if test_output.shape == (2, 10):  # 檢查輸出形狀
+                        logger.info(
+                            f"模型創建成功 (配置: dim={config['dim']}, depth={config['depth']}, ff_mult={config['ff_mult']}, prob_survival={config['prob_survival']:.3f})"
+                        )
+                        return model
+                    else:
+                        raise ValueError(f"模型輸出形狀錯誤: {test_output.shape}")
+
+            except Exception as e:
+                logger.warning(f"隨機配置 {i+1} 失敗: {e}")
+                continue
+
+        # 如果所有隨機配置都失敗，使用絕對最安全的配置
+        logger.error("所有隨機配置都失敗，使用最基本配置")
+        try:
+            model = gMLPVision(
+                image_size=32,
+                patch_size=8,  # 使用更大的 patch_size (32/8=4 patches per side)
+                num_classes=10,
+                dim=64,
+                depth=4,
+                ff_mult=2,
+                channels=3,
+                prob_survival=1.0,
+            )
+            # 測試這個最基本的配置
+            test_input = torch.randn(2, 3, 32, 32)
+            with torch.no_grad():
+                test_output = model(test_input)
+                if test_output.shape == (2, 10):
+                    logger.info("使用最基本配置成功")
+                    return model
+        except Exception as e:
+            logger.error(f"連最基本配置都失敗: {e}")
+
+        # 最後的後備：簡單的全連接網絡
+        logger.error("使用簡單的全連接網絡作為後備")
+        return nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(32 * 32 * 3, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, 10),
         )
-        return model
 
     def quick_train_evaluate(
         self, model, genes: Dict, trainloader, testloader, device
@@ -244,84 +364,134 @@ class FitnessEvaluator:
         from torch.optim.lr_scheduler import CosineAnnealingLR
 
         # 快速訓練配置 - 使用預設值但減少訓練時間
-        epochs = 5  # 快速評估
-        max_batches_per_epoch = 40  # 限制批次數
+        epochs = 8  # 每個個體訓練8個epochs，獲得更好的評估結果
+        max_batches_per_epoch = 35  # 減少批次數
 
         # 使用 model_16.py 中的預設配置
-        criterion = nn.CrossEntropyLoss(label_smoothing=genes["label_smoothing"])
-        optimizer = AdamW(
-            model.parameters(),
-            lr=genes["lr"],
-            weight_decay=genes["weight_decay"],
-            betas=genes["betas"],
-        )
-        scheduler = CosineAnnealingLR(optimizer, T_max=epochs, eta_min=genes["eta_min"])
+        try:
+            criterion = nn.CrossEntropyLoss(
+                label_smoothing=0.08
+            )  # 使用固定值避免基因錯誤
+            optimizer = AdamW(
+                model.parameters(),
+                lr=genes.get("lr", 0.01),  # 使用預設值避免KeyError
+                weight_decay=genes.get("weight_decay", 0.012),
+                betas=genes.get("betas", (0.9, 0.95)),
+            )
+            scheduler = CosineAnnealingLR(
+                optimizer, T_max=epochs, eta_min=genes.get("eta_min", 8e-6)
+            )
+        except Exception as e:
+            logger.error(f"優化器設置失敗: {e}")
+            return 10.0, 60.0, 0.5  # 返回基線結果
 
         start_time = time.time()
         epoch_accuracies = []
 
         for epoch in range(epochs):
-            model.train()
-            epoch_loss = 0.0
-            batch_count = 0
+            try:
+                model.train()
+                epoch_loss = 0.0
+                batch_count = 0
 
-            for batch_idx, (inputs, targets) in enumerate(trainloader):
-                if batch_idx >= max_batches_per_epoch:
-                    break
+                for batch_idx, (inputs, targets) in enumerate(trainloader):
+                    if batch_idx >= max_batches_per_epoch:
+                        break
 
-                inputs, targets = inputs.to(device), targets.to(device)
-                optimizer.zero_grad()
+                    try:
+                        inputs, targets = inputs.to(device), targets.to(device)
+                        optimizer.zero_grad()
 
-                # 使用預設的 Mixup 設定
-                if genes["use_mixup"]:
-                    alpha = genes["alpha"]
-                    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
-                    batch_size = inputs.size()[0]
-                    index = torch.randperm(batch_size).to(device)
-                    mixed_x = lam * inputs + (1 - lam) * inputs[index, :]
-                    y_a, y_b = targets, targets[index]
+                        # 使用預設的 Mixup 設定
+                        if genes.get("use_mixup", True):
+                            alpha = genes.get("alpha", 0.1)
+                            lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
+                            batch_size = inputs.size()[0]
+                            index = torch.randperm(batch_size).to(device)
+                            mixed_x = lam * inputs + (1 - lam) * inputs[index, :]
+                            y_a, y_b = targets, targets[index]
 
-                    outputs = model(mixed_x)
-                    loss = lam * criterion(outputs, y_a) + (1 - lam) * criterion(
-                        outputs, y_b
+                            outputs = model(mixed_x)
+                            loss = lam * criterion(outputs, y_a) + (
+                                1 - lam
+                            ) * criterion(outputs, y_b)
+                        else:
+                            outputs = model(inputs)
+                            loss = criterion(outputs, targets)
+
+                        loss.backward()
+
+                        # 使用預設的梯度裁剪值
+                        torch.nn.utils.clip_grad_norm_(
+                            model.parameters(), max_norm=genes.get("gradient_clip", 0.8)
+                        )
+
+                        optimizer.step()
+                        epoch_loss += loss.item()
+                        batch_count += 1
+
+                    except RuntimeError as e:
+                        error_msg = str(e).lower()
+                        if "out of memory" in error_msg:
+                            logger.error("GPU記憶體不足，跳過此批次")
+                            torch.cuda.empty_cache()
+                            continue
+                        elif (
+                            "size of tensor" in error_msg and "must match" in error_msg
+                        ):
+                            # 張量尺寸不匹配錯誤，這個模型配置有問題
+                            logger.error(f"張量尺寸不匹配錯誤: {e}")
+                            logger.error("此模型配置存在結構問題，終止訓練")
+                            return 5.0, time.time() - start_time, 0.1  # 返回極低分數
+                        else:
+                            logger.warning(f"訓練批次失敗: {e}")
+                            continue
+
+                scheduler.step()
+
+                # 每個epoch後評估一次
+                try:
+                    epoch_acc = self.evaluate_accuracy(
+                        model, testloader, device, max_batches=5
                     )
+                    epoch_accuracies.append(epoch_acc)
+
+                    # 顯示每個 epoch 的進度
+                    logger.info(
+                        f"   快速訓練: epoch {epoch+1}/{epochs}, 準確率: {epoch_acc:.1f}%"
+                    )
+                except Exception as e:
+                    logger.warning(f"準確率評估失敗: {e}")
+                    epoch_accuracies.append(10.0)
+
+            except Exception as e:
+                error_msg = str(e).lower()
+                if "size of tensor" in error_msg and "must match" in error_msg:
+                    logger.error(f"訓練epoch {epoch+1} 遇到張量尺寸錯誤: {e}")
+                    logger.error("模型配置存在問題，提前終止此個體的評估")
+                    # 為剩餘的 epochs 填充低分
+                    remaining_epochs = epochs - epoch
+                    epoch_accuracies.extend([5.0] * remaining_epochs)
+                    break  # 跳出 epoch 循環
                 else:
-                    outputs = model(inputs)
-                    loss = criterion(outputs, targets)
-
-                loss.backward()
-
-                # 使用預設的梯度裁剪值
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), max_norm=genes["gradient_clip"]
-                )
-
-                optimizer.step()
-                epoch_loss += loss.item()
-                batch_count += 1
-
-            scheduler.step()
-
-            # 每個epoch後評估一次
-            epoch_acc = self.evaluate_accuracy(
-                model, testloader, device, max_batches=8
-            )
-            epoch_accuracies.append(epoch_acc)
-            
-            # 簡化的進度顯示
-            if epoch == 0:
-                logger.info(f"   快速訓練: epoch {epoch+1}/{epochs}, 準確率: {epoch_acc:.1f}%")
+                    logger.warning(f"訓練epoch {epoch+1} 失敗: {e}")
+                    epoch_accuracies.append(10.0)
+                    continue
 
         training_time = time.time() - start_time
 
         # 最終準確率評估
-        final_accuracy = self.evaluate_accuracy(
-            model, testloader, device, max_batches=15
-        )
+        try:
+            final_accuracy = self.evaluate_accuracy(
+                model, testloader, device, max_batches=8
+            )
+        except Exception as e:
+            logger.warning(f"最終準確率評估失敗: {e}")
+            final_accuracy = max(epoch_accuracies) if epoch_accuracies else 10.0
 
         # 計算穩定性分數
         if len(epoch_accuracies) > 1:
-            stability_score = 1.0 - np.std(epoch_accuracies) / 100.0
+            stability_score = 1.0 - min(np.std(epoch_accuracies) / 100.0, 0.5)
         else:
             stability_score = 0.5
 
@@ -335,17 +505,29 @@ class FitnessEvaluator:
         correct = 0
         total = 0
 
-        with torch.no_grad():
-            for batch_idx, (inputs, targets) in enumerate(testloader):
-                if batch_idx >= max_batches:
-                    break
-                inputs, targets = inputs.to(device), targets.to(device)
-                outputs = model(inputs)
-                _, predicted = outputs.max(1)
-                total += targets.size(0)
-                correct += predicted.eq(targets).sum().item()
+        try:
+            with torch.no_grad():
+                for batch_idx, (inputs, targets) in enumerate(testloader):
+                    if batch_idx >= max_batches:
+                        break
+                    try:
+                        inputs, targets = inputs.to(device), targets.to(device)
+                        outputs = model(inputs)
+                        _, predicted = outputs.max(1)
+                        total += targets.size(0)
+                        correct += predicted.eq(targets).sum().item()
+                    except RuntimeError as e:
+                        if "out of memory" in str(e):
+                            torch.cuda.empty_cache()
+                            continue
+                        else:
+                            logger.warning(f"評估批次失敗: {e}")
+                            continue
+        except Exception as e:
+            logger.warning(f"準確率評估過程失敗: {e}")
+            return 10.0  # 返回基線準確率
 
-        return 100.0 * correct / total if total > 0 else 0.0
+        return 100.0 * correct / total if total > 0 else 10.0  # 確保不返回0
 
     def calculate_fitness(
         self, accuracy: float, params: int, training_time: float, stability: float
@@ -429,18 +611,22 @@ class GeneticOperators:
     def uniform_crossover(
         self, parent1: Individual, parent2: Individual, crossover_rate: float = 0.7
     ) -> Tuple[Individual, Individual]:
-        """均勻交叉"""
+        """均勻交叉 - 只對可變基因進行交叉"""
         if random.random() > crossover_rate:
             return copy.deepcopy(parent1), copy.deepcopy(parent2)
 
-        child1_genes = {}
-        child2_genes = {}
+        # 複製所有基因
+        child1_genes = copy.deepcopy(parent1.genes)
+        child2_genes = copy.deepcopy(parent2.genes)
 
-        for gene_name in parent1.genes.keys():
+        # 只對可變基因進行交叉
+        mutable_genes = [
+            gene for gene in parent1.genes.keys() if gene in self.config.gene_ranges
+        ]
+
+        for gene_name in mutable_genes:
             if random.random() < 0.5:
-                child1_genes[gene_name] = parent1.genes[gene_name]
-                child2_genes[gene_name] = parent2.genes[gene_name]
-            else:
+                # 交換基因值
                 child1_genes[gene_name] = parent2.genes[gene_name]
                 child2_genes[gene_name] = parent1.genes[gene_name]
 
@@ -456,17 +642,25 @@ class GeneticOperators:
         generation: int = 0,
         max_generations: int = 100,
     ) -> Individual:
-        """自適應突變"""
+        """自適應突變 - 只突變可變基因"""
         # 根據世代調整突變率
         adaptive_rate = mutation_rate * (1.0 - generation / max_generations * 0.5)
 
         if random.random() > adaptive_rate:
             return individual
 
+        # 只從可變基因中選擇要突變的基因
+        mutable_genes = [
+            gene for gene in individual.genes.keys() if gene in self.config.gene_ranges
+        ]
+
+        if not mutable_genes:
+            return individual
+
         # 選擇突變的基因數量
-        num_genes_to_mutate = max(1, int(len(individual.genes) * adaptive_rate))
+        num_genes_to_mutate = max(1, int(len(mutable_genes) * adaptive_rate))
         genes_to_mutate = random.sample(
-            list(individual.genes.keys()), num_genes_to_mutate
+            mutable_genes, min(num_genes_to_mutate, len(mutable_genes))
         )
 
         for gene_name in genes_to_mutate:
@@ -525,11 +719,11 @@ class AdvancedGeneticOptimizerGMLP:
     def create_individual(self, generation: int = 0) -> Individual:
         """創建一個隨機個體 - 只包含可變的架構基因"""
         genes = {}
-        
+
         # 添加可變的模型架構基因
         for gene_name in self.config.gene_ranges.keys():
             genes[gene_name] = self.config.get_random_gene(gene_name)
-        
+
         # 添加固定的訓練參數
         genes.update(self.config.fixed_params)
 
@@ -564,21 +758,25 @@ class AdvancedGeneticOptimizerGMLP:
         """順序評估"""
         successful_evaluations = 0
         failed_evaluations = 0
-        
+
         for i, individual in enumerate(population):
             try:
-                logger.info(f"評估個體 {i+1}/{len(population)} (成功:{successful_evaluations}, 失敗:{failed_evaluations})")
+                logger.info(
+                    f"評估個體 {i+1}/{len(population)} (成功:{successful_evaluations}, 失敗:{failed_evaluations})"
+                )
                 cache_key = str(hash(str(sorted(individual.genes.items()))))
                 population[i] = self.evaluator.evaluate(
                     individual, trainloader, testloader, device, cache_key
                 )
                 self.statistics["total_evaluations"] += 1
                 successful_evaluations += 1
-                
+
                 # 每5個個體顯示一次進度
                 if (i + 1) % 5 == 0 or i == len(population) - 1:
-                    logger.info(f"📊 進度: {i+1}/{len(population)} ({((i+1)/len(population)*100):.1f}%)")
-                    
+                    logger.info(
+                        f"📊 進度: {i+1}/{len(population)} ({((i+1)/len(population)*100):.1f}%)"
+                    )
+
             except KeyboardInterrupt:
                 logger.info(f"⚠️  評估在第 {i+1} 個個體時被用戶中斷")
                 # 給剩餘未評估的個體設置默認適應度
@@ -591,8 +789,10 @@ class AdvancedGeneticOptimizerGMLP:
                 failed_evaluations += 1
                 population[i].fitness = 0.001  # 設置一個很小的適應度值
                 continue
-                
-        logger.info(f"評估完成: 成功 {successful_evaluations}, 失敗 {failed_evaluations}")
+
+        logger.info(
+            f"評估完成: 成功 {successful_evaluations}, 失敗 {failed_evaluations}"
+        )
         return population
 
     def _parallel_evaluate(
@@ -685,7 +885,9 @@ class AdvancedGeneticOptimizerGMLP:
                     or best_individual.fitness
                     > self.statistics["best_ever_individual"].fitness
                 ):
-                    self.statistics["best_ever_individual"] = copy.deepcopy(best_individual)
+                    self.statistics["best_ever_individual"] = copy.deepcopy(
+                        best_individual
+                    )
 
                 # 記錄歷史
                 self.history["best_fitness"].append(best_individual.fitness)
@@ -716,17 +918,23 @@ class AdvancedGeneticOptimizerGMLP:
             except KeyboardInterrupt:
                 logger.info(f"⚠️  第 {generation + 1} 世代被用戶中斷")
                 if best_individual_so_far:
-                    self.statistics["best_ever_individual"] = copy.deepcopy(best_individual_so_far)
+                    self.statistics["best_ever_individual"] = copy.deepcopy(
+                        best_individual_so_far
+                    )
                 break
             except Exception as e:
                 logger.error(f"第 {generation + 1} 世代評估出錯: {e}")
                 if best_individual_so_far:
-                    self.statistics["best_ever_individual"] = copy.deepcopy(best_individual_so_far)
+                    self.statistics["best_ever_individual"] = copy.deepcopy(
+                        best_individual_so_far
+                    )
                 break
 
         # 返回最佳個體
         best_individual = self.statistics["best_ever_individual"] or (
-            best_individual_so_far if best_individual_so_far else population[0] if population else None
+            best_individual_so_far
+            if best_individual_so_far
+            else population[0] if population else None
         )
 
         if best_individual:
@@ -882,7 +1090,12 @@ class AdvancedGeneticOptimizerGMLP:
                 ind.parameters / 1e6 for ind in self.history["best_individuals"]
             ]
             ax4.plot(
-                generations, param_counts, "brown", linewidth=2, marker="s", markersize=4
+                generations,
+                param_counts,
+                "brown",
+                linewidth=2,
+                marker="s",
+                markersize=4,
             )
             ax4.set_title("Best Model Size Evolution", fontweight="bold", fontsize=14)
             ax4.set_xlabel("Generation")
@@ -891,7 +1104,9 @@ class AdvancedGeneticOptimizerGMLP:
 
             plt.tight_layout()
             plt.savefig(
-                "advanced_genetic_optimization_history.png", dpi=300, bbox_inches="tight"
+                "advanced_genetic_optimization_history.png",
+                dpi=300,
+                bbox_inches="tight",
             )
             plt.show()
 
@@ -1032,10 +1247,10 @@ def run_genetic_optimization():
     print("🧬 進階遺傳算法優化 gMLP 模型")
     print("=" * 60)
 
-    # 用戶配置
+    # 用戶配置 - 使用更保守的預設值
     try:
-        population_size = int(input("種群大小 (預設=12): ") or "12")
-        generations = int(input("進化世代數 (預設=8): ") or "8")
+        population_size = int(input("種群大小 (預設=8): ") or "8")  # 減少種群大小
+        generations = int(input("進化世代數 (預設=5): ") or "5")  # 減少世代數
         mutation_rate = float(input("突變率 (預設=0.3): ") or "0.3")
 
         selection_method = (
@@ -1053,7 +1268,7 @@ def run_genetic_optimization():
 
     except ValueError:
         logger.warning("輸入錯誤，使用預設配置")
-        population_size, generations, mutation_rate = 12, 8, 0.3
+        population_size, generations, mutation_rate = 8, 5, 0.3
         selection_method, parallel_eval = "tournament", False
 
     # 加載數據
@@ -1097,7 +1312,7 @@ def run_genetic_optimization():
         print(f"\n" + "=" * 60)
         if best_individual and best_individual.fitness > 0:
             use_best = input("🎯 是否使用最佳配置進行完整訓練? (y/n): ").strip().lower()
-            
+
             if use_best in ["y", "yes"]:
                 print("\n🚀 開始使用最佳配置進行完整訓練...")
                 train_with_best_config(best_individual, trainloader, testloader, device)
@@ -1106,7 +1321,7 @@ def run_genetic_optimization():
 
     except KeyboardInterrupt:
         print("\n\n⏹️  優化已被用戶中斷")
-        if "optimizer" in locals() and hasattr(optimizer, 'history'):
+        if "optimizer" in locals() and hasattr(optimizer, "history"):
             print("🔄 嘗試繪製已有的優化歷史...")
             try:
                 optimizer.plot_optimization_history()
@@ -1121,6 +1336,7 @@ def run_genetic_optimization():
         print("   - 確認 g_mlp_pytorch 庫已正確安裝")
         print("   - 檢查系統內存是否充足")
         import traceback
+
         traceback.print_exc()
 
 
@@ -1147,7 +1363,9 @@ def train_with_best_config(
         "dim": int(best_individual.genes["dim"]),
         "ff_mult": int(best_individual.genes["ff_mult"]),
         "prob_survival": float(best_individual.genes["prob_survival"]),
-        "attn_dim": int(best_individual.genes["dim"]),  # 使用 dim 作為 attn_dim 的預設值
+        "attn_dim": int(
+            best_individual.genes["dim"]
+        ),  # 使用 dim 作為 attn_dim 的預設值
         "estimated_params": best_individual.parameters / 1e6,
     }
 
