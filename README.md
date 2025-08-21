@@ -1,2 +1,3 @@
 # gMLP
-Univerisity project
+用按鈕控制及七節燈顯示線性層轉換後的矩陣(2維 -> 4維)
+
