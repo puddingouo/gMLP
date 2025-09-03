@@ -246,7 +246,7 @@ if __name__ == "__main__":
 
     # 模型架構 (輕量級)
     depth = 1
-    dim = 4
+    dim = 32
     ff_mult = 2
 
     # 訓練參數
@@ -282,3 +282,4 @@ if __name__ == "__main__":
         print("\n❌ 訓練被中斷")
     except Exception as e:
         print(f"\n❌ 發生錯誤: {e}")
+
