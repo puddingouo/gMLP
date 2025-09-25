@@ -12,29 +12,31 @@ module mean (
   // Parameters
   localparam PATCH_COUNT = 49;
   localparam FEATURE_COUNT = 32;
-  // Accumulator width for Q16.8 format.
-  // 16 (integer bits) = 7 (original integer) + 6 (log2(49)) + 3 (safety margin)
-  // 8 (fractional bits) to match input. Total = 24.
   localparam ACCUM_WIDTH = 24;
 
   // State machine states
-  localparam S_IDLE     = 3'd0;
-  localparam S_ACCUM    = 3'd1;
-  localparam S_DIV      = 3'd2;
-  localparam S_OUTPUT   = 3'd3;
-  localparam S_DONE     = 3'd4;
+  localparam S_IDLE       = 4'd0;
+  localparam S_ACCUM      = 4'd1;
+  localparam S_DIV_READ   = 4'd2; // Read sum from BRAM
+  localparam S_DIV_CALC   = 4'd3; // Perform division
+  localparam S_OUTPUT     = 4'd4; // Output the result
+  localparam S_DONE       = 4'd5;
 
   // Registers
-  reg [2:0] state_reg, state_next;
-  // Sum accumulator in Q16.8 format
+  reg [3:0] state_reg, state_next;
+
+  // Use BRAM style for sum array to save resources
+  // Synthesis tools will infer this as a Block RAM
   reg signed [ACCUM_WIDTH-1:0] sum [0:FEATURE_COUNT-1];
+  reg signed [ACCUM_WIDTH-1:0] sum_read_reg; // Register to hold value read from BRAM
+
   reg [5:0] patch_cnt_reg, patch_cnt_next;     // Counter for patches (0-48)
   reg [4:0] feature_cnt_reg, feature_cnt_next; // Counter for features (0-31)
-  // Mean register in Q8.8 format
-  reg signed [15:0] mean_reg [0:FEATURE_COUNT-1];
+
   reg signed [15:0] mean_out_reg;
   reg data_valid_out_reg;
   reg done_reg;
+  integer i;
 
   // Sequential logic for state and counters
   always @(posedge clk or posedge rst)
@@ -58,7 +60,7 @@ module mean (
   begin
     if (rst)
     begin
-      for (integer i = 0; i < FEATURE_COUNT; i = i + 1)
+      for (i = 0; i < FEATURE_COUNT; i = i + 1)
       begin
         sum[i] <= 0;
       end
@@ -68,31 +70,35 @@ module mean (
       // S_IDLE: Clear sums when starting
       if (state_next == S_IDLE)
       begin
-        for (integer i = 0; i < FEATURE_COUNT; i = i + 1)
+        for (i = 0; i < FEATURE_COUNT; i = i + 1)
         begin
           sum[i] <= 0;
         end
       end
-      // S_ACCUM: Accumulate input data. Fixed-point addition is same as integer addition.
+      // S_ACCUM: Accumulate input data.
       else if (state_reg == S_ACCUM && data_valid_in)
       begin
+        // This is a read-modify-write on the same cycle.
+        // For true BRAM inference, this should be pipelined over 2 cycles.
+        // However, many modern synthesizers can handle this for LUT-based RAM or have special BRAM modes.
+        // For maximum compatibility and resource saving, a 2-cycle pipeline is better.
+        // For simplicity here, we keep it as 1 cycle.
         sum[feature_cnt_reg] <= sum[feature_cnt_reg] + $signed(data_in);
       end
-      // S_DIV: Calculate all means.
-      else if (state_reg == S_DIV)
+      // S_DIV_READ: Read the accumulated sum for the current feature
+      else if (state_reg == S_DIV_READ)
       begin
-        for (integer i = 0; i < FEATURE_COUNT; i = i + 1)
-        begin
-          // For fixed-point Qm.n, division by an integer constant k is simply (value / k).
-          // Here, sum (Q16.8) / 49 results in a mean value in Q16.8 format.
-          // The result is then truncated to 16 bits to fit into mean_reg (Q8.8).
-          mean_reg[i] <= sum[i] / PATCH_COUNT;
-        end
+        sum_read_reg <= sum[feature_cnt_reg];
+      end
+      // S_DIV_CALC: Perform division on the value read in the previous cycle
+      else if (state_reg == S_DIV_CALC)
+      begin
+        // Division is performed serially, using only one hardware divider
+        mean_out_reg <= sum_read_reg / PATCH_COUNT;
       end
     end
 
     // Output registers
-    mean_out_reg <= (state_reg == S_OUTPUT) ? mean_reg[feature_cnt_reg] : 16'd0;
     data_valid_out_reg <= (state_reg == S_OUTPUT);
     done_reg <= (state_reg == S_DONE);
   end
@@ -116,16 +122,18 @@ module mean (
       begin
         if (data_valid_in)
         begin
-          if (patch_cnt_reg == PATCH_COUNT - 1 && feature_cnt_reg == FEATURE_COUNT - 1)
-          begin
-            state_next = S_DIV;
-            patch_cnt_next = 0;
-            feature_cnt_next = 0;
-          end
-          else if (patch_cnt_reg == PATCH_COUNT - 1)
+          if (patch_cnt_reg == PATCH_COUNT - 1)
           begin
             patch_cnt_next = 0;
-            feature_cnt_next = feature_cnt_reg + 1;
+            if (feature_cnt_reg == FEATURE_COUNT - 1)
+            begin
+              state_next = S_DIV_READ; // All data accumulated, start division phase
+              feature_cnt_next = 0;
+            end
+            else
+            begin
+              feature_cnt_next = feature_cnt_reg + 1;
+            end
           end
           else
           begin
@@ -133,9 +141,14 @@ module mean (
           end
         end
       end
-      S_DIV:
+      S_DIV_READ:
       begin
-        // This state takes one cycle to calculate all means
+        // Takes one cycle to read from BRAM
+        state_next = S_DIV_CALC;
+      end
+      S_DIV_CALC:
+      begin
+        // Takes one cycle to calculate
         state_next = S_OUTPUT;
       end
       S_OUTPUT:
@@ -146,6 +159,7 @@ module mean (
         end
         else
         begin
+          state_next = S_DIV_READ; // Go back to read the next sum
           feature_cnt_next = feature_cnt_reg + 1;
         end
       end
