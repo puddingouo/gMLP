@@ -1,0 +1,49 @@
+# --- 1. 環境設定 (依照你提供的路徑) ---
+# 注意 : 最前面加了 "." 代表包含當前目錄，這樣才找得到你的 RTL
+set search_path " /process/T18/IP/CBDK_TSMC018_Arm_v4.0/CIC/SynopsysDC/db"
+
+set target_library "slow.db"
+
+# 關鍵修正 :
+# "*" -> 讓 DC 能搜尋記憶體中已讀入的模組 (你自己寫的 qmult)
+# "dw_foundation.sldb" -> 讓 DC 能使用 DesignWare 庫來優化乘法器 (*)
+set link_library   "* $target_library dw_foundation.sldb"
+
+set symbol_library "slow.db"
+
+# --- 2. 讀入設計 ---
+# 請確認你的 RTL 放在 RTL 資料夾內
+read_verilog { ./RTL/sequ_scale_mul_booth.v ./RTL/sequ_scale_mul_booth_encoder.v}
+
+current_design sequ_scale_mul_booth
+link
+
+#saif
+reset_switching_activity
+read_saif -input "./sequ_scale_mul_booth.saif" -instance_name "sequ_scale_mul_booth_tb/uut" -verbose
+report_saif -hier
+
+# --- 3. 設定時脈 (100MHz) ---
+create_clock -name "clk" -period 10 -waveform {0 5} [get_ports clk]
+#set_dont_touch_network [get_clocks clk]
+set_fix_hold [get_clocks clk]
+
+# 設定 Input/Output Delay
+set_input_delay 1 -clock clk [remove_from_collection [all_inputs] [get_ports clk]]
+set_output_delay 1 -clock clk [all_outputs]
+
+set_load 0.2 [all_outputs]
+# set_max_delays 10
+
+# --- 4. 執行綜合 ---
+compile -map_effort medium
+
+# --- 5. 輸出檔案 (存到 Netlist 資料夾) ---
+write -format verilog -hierarchy -output ./Netlist/sequ_scale_mul_booth_gate.v
+write_sdc ./Netlist/sequ_scale_mul_booth.sdc
+write_sdf ./Netlist/sequ_scale_mul_booth.sdf
+report_timing > timing.rep
+report_power > power.rep
+
+#gui_show
+exit

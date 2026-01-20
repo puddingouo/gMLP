@@ -1,0 +1,32 @@
+all: run_all
+
+run_all: clean rtl_sim saif syn gate_sim power
+
+# 1. [RTL Simulation]
+rtl_sim:
+	vcs -full64 -R -debug_access+all RTL/sequ_scale_mul_booth_tb.v RTL/sequ_scale_mul_booth.v RTL/sequ_scale_mul_booth_encoder.v
+
+saif:
+	fsdb2saif sequ_scale_mul_booth.fsdb -o sequ_scale_mul_booth.saif
+
+# 2. [Synthesis]
+syn:
+	dc_shell -f run_dc.tcl
+
+# 3. [Gate Simulation]
+gate_sim:
+	vcs -full64 -R \
+	RTL/sequ_scale_mul_booth_tb.v \
+	./Netlist/sequ_scale_mul_booth_gate.v \
+	-debug_access+all \
+	-v /process/T18/IP/CBDK_TSMC018_Arm_v4.0/CIC/Verilog/tsmc18_neg.v +neg_tchk +axdelays
+
+# 4. [Power Analysis]
+power:
+	pt_shell -f run_pt.tcl
+
+verdi:
+	verdi -ssf sequ_scale_mul_booth.fsdb &
+
+clean:
+	rm -rf csrc simv* *.log *.svf *.sdf *.key *.fsdb *.vcd ucli.key
